@@ -12,12 +12,16 @@
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* how many runs to average by default */
 #define DEFAULT_NR_LOOPS 10
 
 /* we have 3 tests at the moment */
 #define MAX_TESTS 3
+
+/* default number of workers */
+#define DEFAULT_WORKERS 8
 
 /* default block size for test 2, in bytes */
 #define DEFAULT_BLOCK_SIZE 262144
@@ -28,7 +32,7 @@
 #define TEST_MCBLOCK 2
 
 /* version number */
-#define VERSION "1.5"
+#define VERSION "1.6"
 
 /*
  * MBW memory bandwidth benchmark
@@ -40,7 +44,7 @@
  * http://github.com/raas/mbw
  *
  * compile with:
- *			gcc -O -o mbw mbw.c
+ *			gcc -O -o mbw mbw.c -lpthread
  *
  * run with eg.:
  *
@@ -57,6 +61,7 @@ void usage()
     printf("Usage: mbw [options] array_size_in_MiB\n");
     printf("Options:\n");
     printf("	-n: number of runs per test (0 to run forever)\n");
+    printf("	-w: number of workers (threads, default: %d)\n", DEFAULT_WORKERS);
     printf("	-a: Don't display average\n");
     printf("	-t%d: memcpy test\n", TEST_MEMCPY);
     printf("	-t%d: dumb (b[i]=a[i] style) test\n", TEST_DUMB);
@@ -69,6 +74,40 @@ void usage()
 }
 
 /* ------------------------------------------------------ */
+
+typedef struct {
+    unsigned long long asize;
+    long *a;
+    long *b;
+    int type;
+    unsigned long long block_size;
+} thread_param_t;
+
+void *thread_routine(void *p)
+{
+    thread_param_t *params = (thread_param_t *)p;
+    unsigned long long t;
+    unsigned int long_size = sizeof(long);
+    unsigned long long array_bytes = params->asize * long_size;
+
+    if (params->type == TEST_MEMCPY) { /* memcpy test */
+        memcpy(params->b, params->a, array_bytes);
+    } else if (params->type == TEST_MCBLOCK) { /* memcpy block test */
+        char* src = (char*)params->a;
+        char* dst = (char*)params->b;
+        for (t = array_bytes; t >= params->block_size; t -= params->block_size, src += params->block_size) {
+            dst = (char *) memcpy(dst, src, params->block_size) + params->block_size;
+        }
+        if (t) {
+            dst = (char *) memcpy(dst, src, t) + t;
+        }
+    } else if (params->type == TEST_DUMB) { /* dumb test */
+        for (t = 0; t < params->asize; t++) {
+            params->b[t] = params->a[t];
+        }
+    }
+    return NULL;
+}
 
 /* allocate a test array and fill it with data
  * so as to force Linux to _really_ allocate it */
@@ -99,39 +138,43 @@ long *make_array(unsigned long long asize)
  *
  * return value: elapsed time in seconds
  */
-double worker(unsigned long long asize, long *a, long *b, int type, unsigned long long block_size)
+double worker(unsigned long long asize, long *a, long *b, int type, unsigned long long block_size, int num_workers)
 {
-    unsigned long long t;
     struct timeval starttime, endtime;
     double te;
-    unsigned int long_size=sizeof(long);
-    /* array size in bytes */
-    unsigned long long array_bytes=asize*long_size;
+    int i;
 
-    if(type==TEST_MEMCPY) { /* memcpy test */
-        /* timer starts */
-        gettimeofday(&starttime, NULL);
-        memcpy(b, a, array_bytes);
-        /* timer stops */
-        gettimeofday(&endtime, NULL);
-    } else if(type==TEST_MCBLOCK) { /* memcpy block test */
-        char* src = (char*)a;
-        char* dst = (char*)b;
-        gettimeofday(&starttime, NULL);
-        for (t=array_bytes; t >= block_size; t-=block_size, src+=block_size){
-            dst=(char *) memcpy(dst, src, block_size) + block_size;
-        }
-        if(t) {
-            dst=(char *) memcpy(dst, src, t) + t;
-        }
-        gettimeofday(&endtime, NULL);
-    } else if(type==TEST_DUMB) { /* dumb test */
-        gettimeofday(&starttime, NULL);
-        for(t=0; t<asize; t++) {
-            b[t]=a[t];
-        }
-        gettimeofday(&endtime, NULL);
+    pthread_t *threads = malloc(num_workers * sizeof(pthread_t));
+    thread_param_t *params = malloc(num_workers * sizeof(thread_param_t));
+    unsigned long long chunk_asize = asize / num_workers;
+
+    if (NULL == threads || NULL == params) {
+        perror("Error allocating memory for threads");
+        exit(1);
     }
+
+    /* timer starts */
+    gettimeofday(&starttime, NULL);
+
+    for (i = 0; i < num_workers; i++) {
+        params[i].a = a + i * chunk_asize;
+        params[i].b = b + i * chunk_asize;
+        params[i].type = type;
+        params[i].block_size = block_size;
+        /* give last worker the remainder */
+        params[i].asize = (i == num_workers - 1) ? (asize - i * chunk_asize) : chunk_asize;
+        pthread_create(&threads[i], NULL, thread_routine, &params[i]);
+    }
+
+    for (i = 0; i < num_workers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    /* timer stops */
+    gettimeofday(&endtime, NULL);
+
+    free(threads);
+    free(params);
 
     te=((double)(endtime.tv_sec*1000000-starttime.tv_sec*1000000+endtime.tv_usec-starttime.tv_usec))/1000000;
 
@@ -182,6 +225,8 @@ int main(int argc, char **argv)
 
     /* how many runs to average? */
     int nr_loops=DEFAULT_NR_LOOPS;
+    /* how many workers to use? */
+    int num_workers=DEFAULT_WORKERS;
     /* fixed memcpy block size for -t2 */
     unsigned long long block_size=DEFAULT_BLOCK_SIZE;
     /* show average, -a */
@@ -195,7 +240,7 @@ int main(int argc, char **argv)
     tests[1]=0;
     tests[2]=0;
 
-    while((o=getopt(argc, argv, "haqn:t:b:")) != EOF) {
+    while((o=getopt(argc, argv, "haqn:t:b:w:")) != EOF) {
         switch(o) {
             case 'h':
                 usage();
@@ -219,6 +264,13 @@ int main(int argc, char **argv)
                 block_size=strtoull(optarg, (char **)NULL, 10);
                 if(0>=block_size) {
                     printf("Error: what block size do you mean?\n");
+                    exit(1);
+                }
+                break;
+            case 'w': /* number of workers */
+                num_workers=strtoul(optarg, (char **)NULL, 10);
+                if(0>=num_workers) {
+                    printf("Error: number of workers must be > 0\n");
                     exit(1);
                 }
                 break;
@@ -267,6 +319,7 @@ int main(int argc, char **argv)
     if(!quiet) {
         printf("Long uses %d bytes. ", long_size);
         printf("Allocating 2*%lld elements = %lld bytes of memory.\n", asize, 2*asize*long_size);
+        printf("Using %d worker threads.\n", num_workers);
         if(tests[2]) {
             printf("Using %lld bytes as blocks for memcpy block copy test.\n", block_size);
         }
@@ -285,7 +338,7 @@ int main(int argc, char **argv)
         te_sum=0;
         if(tests[testno]) {
             for (i=0; nr_loops==0 || i<nr_loops; i++) {
-                te=worker(asize, a, b, testno, block_size);
+                te=worker(asize, a, b, testno, block_size, num_workers);
                 te_sum+=te;
                 printf("%d\t", i);
                 printout(te, mt, testno);
