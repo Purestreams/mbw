@@ -14,10 +14,9 @@ To better saturate the memory controller and achieve a more accurate measurement
 
 ## Compilation
 
-The program now depends on the `pthread` library. To compile, you must link against it:
-
 ```sh
-gcc -O -o mbw mbw.c -lpthread
+cd mbw
+make
 ```
 
 ## Performance Differences
